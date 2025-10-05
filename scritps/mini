@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import io
+import os
+import sys
+import shutil
+import struct
+import re
+from pathlib import Path
+import zstandard as zstd
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn
+from rich.prompt import Prompt
+
+console = Console()
+
+# ---------- CONFIG ----------
+PAK_FILE = "mini_obb.pak"
+OUTPUT_DIR = Path("Output")
+EDITED_DIR = Path("Edited_uasset")
+REPACKED_DIR = Path("Repacked")
+SIGNATURE = b"\xCD\xEE\x61\x2C"
+EXPECTED_MAGIC = b"\x28\xB5\x2F\xFD"
+CHUNK = 64 * 1024  # 64KB IO chunk
+FILES_PER_FOLDER = 1000
+
+SIGNATURES = {
+    b'\x7B\x0D\x0A\x09\x22\x46\x69\x6C\x65\x56\x65\x72\x73\x69\x6F\x6E': ".json",
+    b'\x20\x00\xDA\x27\x14\x00\x00\x00\x00\x00\x02\x00\x52\x65\x73\x42': ".res",
+    b'\x1B\x4C\x75\x61\x53\x00\x19\x93\x0D\x0A\x1A\x0A\x04\x04\x04\x08': ".lua",
+    b'\xC1\x83\x2A\x9E\xF9\xFF\xFF\xFF\x00\x00\x00\x00\x00\x00\x00\x00': ".uasset",
+    b'\x42\x4B\x48\x44\x18\x00\x00\x00\x7D': ".bnk",
+    b'\x7B\x0D\x0A\x20\x20\x22\x46\x69\x6C\x65\x56\x65\x72\x73\x69\x6F': ".json",
+    b'\xFF\xFE\x7B\x00\x0D\x00\x09\x00\x22\x00\x46\x00\x69\x00': ".json"
+}
+
+# ---------- HELPERS ----------
+def find_xor_key(sig4: bytes, magic4: bytes) -> bytes:
+    try:
+        return bytes([sig4[i] ^ magic4[i] for i in range(4)])
+    except IndexError:
+        console.print("[red]Error: Invalid signature or magic bytes length[/red]")
+        raise
+
+def xor_feedback_block(data: bytes, key: bytes) -> bytes:
+    key_len = len(key)
+    out = bytearray(len(data))
+    prev = [0] * key_len
+    for i in range(len(data)):
+        if i < key_len:
+            out[i] = data[i] ^ key[i]
+            prev[i] = out[i]
+        else:
+            k = i % key_len
+            out[i] = data[i] ^ prev[k]
+            prev[k] = out[i]
+    return bytes(out)
+
+def detect_extension(data: bytes) -> str:
+    for sig, ext in SIGNATURES.items():
+        if data.startswith(sig):
+            return ext
+    return ".uexp"
+
+def decompress_zstd(data: bytes) -> bytes:
+    dctx = zstd.ZstdDecompressor()
+    try:
+        return dctx.decompress(data)
+    except zstd.ZstdError:
+        return data
+
+def find_all_occurrences(data, pattern: bytes):
+    return [m.start() for m in re.finditer(re.escape(pattern), data)]
+
+# ---------- DECOMPRESS ----------
+def unpack_pak(pak_path: Path):
+    if not pak_path.exists():
+        console.print(f"[red]Pak file not found: {pak_path}[/red]")
+        return
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    console.print(f"[cyan]Reading pak file: {pak_path}[/cyan]")
+    data = pak_path.read_bytes()
+    console.print(f"[cyan]File size: {len(data):,} bytes[/cyan]")
+
+    offsets = find_all_occurrences(data, SIGNATURE)
+    if not offsets:
+        console.print("[red]No blocks found![/red]")
+        return
+
+    console.print(f"[cyan]Found {len(offsets)} blocks[/cyan]")
+
+    with Progress(TextColumn("{task.description}"), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), console=console) as prog:
+        task = prog.add_task("Unpacking...", total=len(offsets))
+        for idx, offset in enumerate(offsets):
+            end = offsets[idx+1] if idx+1 < len(offsets) else len(data)
+            block = data[offset:end]
+            key = find_xor_key(block[:4], EXPECTED_MAGIC)
+            decoded = xor_feedback_block(block, key)
+            decompressed = decompress_zstd(decoded)
+            ext = detect_extension(decompressed)
+            # Use folder structure consistent with FILES_PER_FOLDER
+            subfolder = _ensure_output_subfolder(idx)
+            file_name = subfolder / f"{idx:08d}{ext}"
+            file_name.write_bytes(decompressed)
+            console.print(f"[green][{idx+1}/{len(offsets)}] Extracted {file_name.relative_to(OUTPUT_DIR)} ({len(decompressed):,} bytes)[/green]")
+            prog.update(task, advance=1)
+
+    console.print(f"[bold green]Done → {OUTPUT_DIR}/[/bold green]")
+
+# ---------- DECOMPRESS (streaming) ----------
+def _ensure_output_subfolder(index: int):
+    folder_index = index // FILES_PER_FOLDER
+    sub = OUTPUT_DIR / f"{folder_index:04d}"
+    sub.mkdir(parents=True, exist_ok=True)
+    return sub
+
+# ---------- COMPRESS HELPERS ----------
+def add_skippable_padding(compressed: bytes, pad_len: int) -> bytes:
+    if pad_len <= 0:
+        return compressed
+    result = bytearray(compressed)
+    while pad_len > 0:
+        frame_content_len = min(pad_len - 8, 1024 * 1024)  # cap content to 1MB to avoid large frames
+        if frame_content_len < 0:
+            # For small pads <8, add a frame with 0 content and adjust
+            magic = b'\x50\x2A\x4D\x18'
+            size_bytes = struct.pack('<I', 0)
+            skip_frame = magic + size_bytes + b'\x00' * 0
+            result += skip_frame
+            pad_len -= 8
+            console.print(f"[yellow]Added minimal skippable frame for small pad[/yellow]")
+        else:
+            magic = b'\x50\x2A\x4D\x18'
+            size_bytes = struct.pack('<I', frame_content_len)
+            skip_frame = magic + size_bytes + b'\x00' * frame_content_len
+            result += skip_frame
+            pad_len -= (8 + frame_content_len)
+    if pad_len < 0:
+        console.print("[yellow]Padding overshot; trimming excess[/yellow]")
+        result = result[:len(result) + pad_len]  # trim if over
+    return bytes(result)
+
+def compress_to_target_size(data: bytes, target_size: int) -> bytes:
+    if target_size <= 0:
+        console.print("[red]Invalid target size for compression[/red]")
+        return b""
+    # Start from high compression to low for better fitting
+    levels = range(22, 0, -3)
+    for level in levels:
+        cctx = zstd.ZstdCompressor(level=level)
+        compressed = cctx.compress(data)
+        if len(compressed) <= target_size:
+            return add_skippable_padding(compressed, target_size - len(compressed))
+    # Try ultra compression with more params
+    cctx = zstd.ZstdCompressor(level=22, threads=-1)
+    compressed = cctx.compress(data)
+    if len(compressed) <= target_size:
+        return add_skippable_padding(compressed, target_size - len(compressed))
+    # Truncation as last resort, but warn and skip in repack
+    console.print("[red]Cannot compress to target size even with max compression. Will not repack this block to avoid corruption.[/red]")
+    return None  # Return None to indicate failure
+
+def _find_edited_file_for_index(i: int):
+    folder_index = i // FILES_PER_FOLDER
+    filename_base = f"{i:08d}"
+    candidates = [
+        EDITED_DIR / f"{folder_index:04d}" / (filename_base + ".uexp"),
+        EDITED_DIR / (filename_base + ".uexp"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+# ---------- REPACK (streaming) ----------
+def repack_stream(pak_file: str):
+    pak_path = Path(pak_file)
+    if not pak_path.exists():
+        console.print(f"[red]Original pak not found: {pak_path}[/red]")
+        return
+    if not EDITED_DIR.exists():
+        console.print(f"[red]Edited directory not found: {EDITED_DIR}[/red]")
+        return
+    if REPACKED_DIR.exists():
+        shutil.rmtree(REPACKED_DIR)
+    REPACKED_DIR.mkdir(parents=True, exist_ok=True)
+
+    file_size = pak_path.stat().st_size
+    # Read the entire file for offset detection
+    console.print(f"[cyan]Reading pak file for repacking: {pak_path}[/cyan]")
+    data = pak_path.read_bytes()
+    offsets = find_all_occurrences(data, SIGNATURE)
+    if not offsets:
+        console.print("[red]No blocks found to repack![/red]")
+        return
+
+    out_tmp = REPACKED_DIR / (pak_path.name + ".tmp")
+    console.print(f"[cyan]Repacking to: {out_tmp}[/cyan]")
+
+    # Copy the entire original file first
+    try:
+        with open(pak_path, "rb") as infh, open(out_tmp, "wb") as outfh:
+            infh.seek(0)
+            outfh.write(infh.read())
+            console.print("[green]Copied original file as base[/green]")
+    except Exception as e:
+        console.print(f"[red]Error copying original file: {e}[/red]")
+        return
+
+    # Overwrite only modified chunks
+    try:
+        with open(out_tmp, "r+b") as outfh, Progress(TextColumn("{task.description}"), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), console=console) as prog:
+            task = prog.add_task("Repacking modded blocks...", total=len(offsets))
+            modified_count = 0
+            for i, start in enumerate(offsets):
+                end = offsets[i+1] if i+1 < len(offsets) else file_size
+                original_chunk_size = end - start
+
+                edited_file = _find_edited_file_for_index(i)
+                if edited_file:
+                    console.print(f"[cyan]Found edited uexp for block {i}: {edited_file.relative_to(EDITED_DIR)}[/cyan]")
+                    try:
+                        new_data = edited_file.read_bytes()
+                        comp = compress_to_target_size(new_data, original_chunk_size)
+                        if comp is None:
+                            console.print(f"[yellow]Skipping repack for block {i} due to compression failure[/yellow]")
+                            prog.update(task, advance=1)
+                            continue
+                        
+                        # Read original signature
+                        with open(pak_path, "rb") as infh:
+                            infh.seek(start)
+                            sig4 = infh.read(4)
+                            if len(sig4) < 4:
+                                console.print(f"[red]Cannot read sig4 at {start}; skipping block {i}[/red]")
+                                prog.update(task, advance=1)
+                                continue
+                        key = find_xor_key(sig4, EXPECTED_MAGIC)
+                        
+                        # Write XOR-encoded data
+                        outfh.seek(start)
+                        klen = len(key)
+                        prev = list(key)
+                        ptr = 0
+                        written = 0
+                        while ptr < len(comp):
+                            slice_len = min(CHUNK, len(comp) - ptr)
+                            src_slice = comp[ptr:ptr+slice_len]
+                            out_slice = bytearray(slice_len)
+                            base_idx = ptr % klen
+                            for j in range(slice_len):
+                                idx = (base_idx + j) % klen
+                                r = src_slice[j] ^ prev[idx]
+                                out_slice[j] = r
+                                prev[idx] = src_slice[j]
+                            outfh.write(out_slice)
+                            ptr += slice_len
+                            written += slice_len
+                        if written < original_chunk_size:
+                            outfh.write(b'\x00' * (original_chunk_size - written))
+                        elif written > original_chunk_size:
+                            outfh.truncate(outfh.tell() - (written - original_chunk_size))
+                        console.print(f"[green]Repacked modded block {i}[/green]")
+                        modified_count += 1
+                    except Exception as e:
+                        console.print(f"[red]Error repacking block {i}: {e}[/red]")
+                # No print for unmodified to avoid flood
+                prog.update(task, advance=1)
+        
+        console.print(f"[bold green]Repacked {modified_count} modified blocks[/bold green]")
+        final_out = REPACKED_DIR / pak_path.name
+        out_tmp.replace(final_out)
+        # Check size
+        if final_out.stat().st_size != pak_path.stat().st_size:
+            console.print("[red]Warning: Repacked file size differs from original! May cause issues.[/red]")
+        else:
+            console.print("[green]Repacked file size matches original.[/green]")
+        console.print(f"[bold green]Repacking complete → {final_out}[/bold green]")
+    except Exception as e:
+        console.print(f"[red]Error during repacking: {e}[/red]")
+        return
+
+# ---------- ANALYZE ----------
+def analyze_files():
+    if not OUTPUT_DIR.exists():
+        console.print("[red]Decompressed blocks directory not found![/red]")
+        return
+    files = sorted(OUTPUT_DIR.rglob("*"))
+    uasset = uexp = jsonc = bins = 0
+    for f in files:
+        if not f.is_file():
+            continue
+        try:
+            with open(f, "rb") as fh:
+                head = fh.read(512)
+            ext = detect_extension(head)
+            if ext == ".uasset": uasset += 1
+            elif ext == ".uexp": uexp += 1
+            elif ext == ".json": jsonc += 1
+            else: bins += 1
+            if f.suffix != ext:
+                new = f.with_suffix(ext)
+                f.rename(new)
+                console.print(f"[cyan]Renamed {f.relative_to(OUTPUT_DIR)} -> {new.relative_to(OUTPUT_DIR)}[/cyan]")
+        except Exception as e:
+            console.print(f"[red]Error analyzing {f}: {e}[/red]")
+    console.print(f"[bold cyan]Results: UASSET={uasset} UEXP={uexp} JSON={jsonc} BIN={bins}[/bold cyan]")
+
+# ---------- CLEAR DECOMPRESSED ----------
+def clear_decompressed():
+    if OUTPUT_DIR.exists():
+        shutil.rmtree(OUTPUT_DIR)
+        console.print(f"[green]Deleted {OUTPUT_DIR}[/green]")
+    else:
+        console.print(f"[yellow]{OUTPUT_DIR} not found[/yellow]")
+
+# ---------- MAIN ----------
+def main():
+    import argparse
+    import sys
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Mini Unpack/Repack Script")
+    parser.add_argument("command", choices=["unpack", "repack", "analyze", "clear"],
+                        help="Command to run: unpack, repack, analyze, clear")
+    args = parser.parse_args()
+
+    try:
+        import zstandard, rich
+        console.print("[green]Dependencies (zstandard, rich) are installed[/green]")
+    except ImportError as e:
+        console.print(f"[red]Missing dependency: {e}. Install with 'pip install zstandard rich'[/red]")
+        sys.exit(1)
+
+    try:
+        if args.command == "unpack":
+            unpack_pak(Path(PAK_FILE))
+        elif args.command == "repack":
+            repack_stream(PAK_FILE)
+        elif args.command == "analyze":
+            analyze_files()
+        elif args.command == "clear":
+            clear_decompressed()
+    except KeyboardInterrupt:
+        console.print("[yellow]Operation cancelled by user[/yellow]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(f"[red]Unexpected error: {e}[/red]")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
