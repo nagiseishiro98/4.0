@@ -19,12 +19,17 @@ from pathlib import Path
 from typing import Optional
 
 # ---------------------- Base paths (script location) ------------------------
-BASEDIR = Path(__file__).parent.resolve()
+from pathlib import Path
+
+# Base directory in Termux home/PAK
+BASEDIR = Path.home() / "PAK"
+
 GAMEPATCH_DIR = BASEDIR / "GAMEPATCH_FILES"
 UNPACK_DIR = BASEDIR / "UNPACK_FILES"
 REPACK_DIR = BASEDIR / "REPACK_FILES"
 RESULT_DIR = BASEDIR / "RESULT"
 
+# Create directories if they don't exist
 for d in (GAMEPATCH_DIR, UNPACK_DIR, REPACK_DIR, RESULT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
