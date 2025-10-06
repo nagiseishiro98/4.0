@@ -114,16 +114,23 @@ class PAKTool:
         self.DICT_SIZE = 1024 * 1024  # 1MB = 1,048,576 bytes
         
         # Directory setup according to new structure
-        self.input_dir = Path("input")           # Original OBB files
-        self.repack_obb_dir = Path("repack_obb") # OBB copied here for repacking
-        self.unpack_pak_dir = Path("unpack_pak") # Unpacked DAT files
-        self.edited_dat_dir = Path("edited_dat") # Edited DAT files for repacking
-        self.repack_pak_dir = Path("repack_pak") # Repacked PAK files
-        self.tmp_dir = Path("tmp")               # Temporary files (dictionary, compression, etc.)
-        
-        # Create directories if they don't exist
-        for dir_path in [self.input_dir, self.repack_obb_dir, self.unpack_pak_dir, self.edited_dat_dir, self.repack_pak_dir, self.tmp_dir]:
-            dir_path.mkdir(exist_ok=True)
+        from pathlib import Path
+
+# Base directory in Termux
+BASE_DIR = Path.home() / "SKIN" / "BGMI"
+
+# Permanent paths
+self.input_dir       = BASE_DIR / "input"        # Original OBB files
+self.repack_obb_dir  = BASE_DIR / "repack_obb"   # OBB copied here for repacking
+self.unpack_pak_dir  = BASE_DIR / "unpack_pak"   # Unpacked DAT files
+self.edited_dat_dir  = BASE_DIR / "edited_dat"   # Edited DAT files for repacking
+self.repack_pak_dir  = BASE_DIR / "repack_pak"   # Repacked PAK files
+self.tmp_dir         = BASE_DIR / "tmp"          # Temporary files (dictionary, compression)
+
+# Make sure directories exist
+for d in [self.input_dir, self.repack_obb_dir, self.unpack_pak_dir, 
+          self.edited_dat_dir, self.repack_pak_dir, self.tmp_dir]:
+    d.mkdir(parents=True, exist_ok=True)
     
     def get_zsdic_pak(self):
         """Get the zsdic PAK file, extract from OBB if needed"""
@@ -880,3 +887,4 @@ if __name__ == "__main__":
     
     PEACE OUT 
     DONT FIGHT TO BE THE FIRST INSTEAD FIGHT TO BE BETTER THAN OTHER"""
+
